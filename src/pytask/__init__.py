@@ -5,6 +5,8 @@ from pathlib import Path
 import datetime
 import os
 import rich
+import uuid
+
 
 
 class Status(Enum):
@@ -37,6 +39,15 @@ class Task:
 class TaskList:
     tasks: list[Task] = field(default_factory=list)
 
+class TaskAction(Enum):
+    ADD = task_add()
+
+class ProgInput:
+    def __init__(self, args: list[str]) -> None:
+        for arg in args:
+            match arg:
+                case _:
+                    result = "2"
     
 
 env_path = os.getenv("PYTASK_CONFIG")
@@ -62,6 +73,9 @@ parser = argparse.ArgumentParser(
     description="A python-based note/todo tracker",
 )
 parser.add_argument("args", nargs="*")
+                
+    
+
         
 def main() -> None:
     args = parser.parse_args().args
