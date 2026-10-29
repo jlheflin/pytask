@@ -1,149 +1,143 @@
+from rich.console import Console
+from rich.text import Text
+import sqlite3
 import argparse
-from dataclasses import dataclass, field, asdict
-from enum import Enum
 from pathlib import Path
-import datetime
-import calendar
 import os
-import rich
-import uuid
-import json
+from .schema import schema
+from uuid import uuid4
+from datetime import date
+from pprint import pp
 
-env_path = os.getenv("PYTASK_CONFIG")
-if env_path:
-    PYTASK_CONFIG = Path(env_path).expanduser()
-else:
-    PYTASK_CONFIG = Path.home() / ".pytask"
+DB_PATH = Path(
+    os.getenv("PYTASK_DB_PATH") or
+    Path().home() / ".pytask" / "pytask.db"
+)
 
-if not PYTASK_CONFIG.exists():
-    ans = input(f"Running first time setup, okay to create {PYTASK_CONFIG.absolute()}? [y/N]: ")
-    if ans == "" or ans.lower() == "n":
-        err = f"""\
-        Not creating {PYTASK_CONFIG.absolute()} due to user denial.
-        """
-        raise RuntimeError(err)
-    elif ans != "" and ans.lower() != "y":
-        raise ValueError(f"Invalid input.")
-    elif ans.lower() == "y":
-        PYTASK_CONFIG.mkdir(exist_ok=True)
-        folders = [
-            "pending",
-            "done",
-            "paused",
-            "active"
-        ]
-        for folder in folders:
-            path = PYTASK_CONFIG / folder
-            path.mkdir(exist_ok=True)
+def get_connection() -> sqlite3.Connection:
+    con = sqlite3.connect(DB_PATH)
+    con.execute("PRAGMA foreign_keys = ON")
+    return con
+
+if not DB_PATH.exists():
+    print("Initializing pytask database...")
+    print(f"pytask database location: {DB_PATH}")
+    prompt: str = f"Would you like to create a database in this location? [Y/n]: "
+    ans: str = input(prompt).strip().lower()
+    if ans not in ("", "y", "yes"):
+        raise SystemExit("Aborted: no database created")
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with get_connection() as con:
+        con.executescript(schema)
+
+attribute_list = [
+    "due",
+    "project"
+]
+
+
+def print_tasks(task_inputs):
+    with get_connection() as db:
+        rows = db.execute("SELECT * FROM Taskset WHERE is_deleted = 0 AND is_completed = 0").fetchall()
+    if rows:
+        for row in rows:
+            print(row)
+    else:
+        print("No tasks yet! Add them via pytask add")
+
+def add_task(task_inputs):
+    tags: list[str] = [i for i in task_inputs if i.startswith('+')]
+    words = [w for w in task_inputs if not w.startswith('+') and ":" not in w]
+    attributes = [a for a in task_inputs if ':' in a and a.split(':')[0] in attribute_list]
+    with get_connection() as db:
+        rows = db.execute("SELECT display_id FROM Taskset WHERE display_id IS NOT NULL").fetchall()
+        display_ids: list[int] = [display_id[0] for display_id in rows]
+        summary = " ".join(words)
+        if not display_ids:
+            display_id = 1
+        else:
+            max_id = max(display_ids)
+            avail_ids = [i for i in range(1, max_id) if i not in display_ids]
+            if not avail_ids:
+                display_id = max_id + 1
+            else:
+                display_id = min(avail_ids)
+        db.execute(
+            """
+                INSERT INTO Taskset (
+                    display_id,
+                    task_uuid,
+                    summary,
+                    created_date
+                ) VALUES (?,?,?,?)
+            """,
+            (display_id, str(uuid4()), summary, date.today())
+        )
+        for tag in tags:
+            name = tag[1:]
+            row = db.execute(
+                "SELECT tag_id FROM Tag WHERE tag_name = ?",
+                (name,)
+            ).fetchone()
+            if row:
+                tag_id = row[0]
+            else:
+                tag_id = (
+                    row[0] if row else db.execute("INSERT INTO Tag (tag_name) VALUES (?)", (name,))
+                ).lastrowid
+            
+    print(f"Added task {display_id} {summary}")
+
+def remove_task(task_list):
+    task_list = [int(t) for t in task_list]
+    with get_connection() as db:
+        rows = db.execute("SELECT display_id FROM Taskset").fetchall()
+        display_ids = [display_id[0] for display_id in rows]
+        for task in task_list:
+            if task not in display_ids:
+                raise ValueError(f"{task} not in task IDs")
+        for task in task_list:
+            db.execute(
+                "UPDATE Taskset SET is_deleted = 1, display_id = NULL, resolved_date = ? WHERE display_id = ?",
+                (date.today().isoformat(), task)
+            )
+
+    print("Removing task")
+
+def modify_task(task_inputs):
+    print(task_inputs)
+    print("Modifying task")
+
+def note_task(task_list):
+    print(task_list)
+    print("Adding note to task")
+
+def edit_task(task_list):
+    print(task_list)
+    print("Editing task")
+
+action_set = {
+    "next": print_tasks,
+    "add": add_task,
+    "remove": remove_task,
+    "modify": modify_task,
+    "note": note_task,
+    "edit": edit_task
+}
 
 parser = argparse.ArgumentParser(
-    prog="pytask",
-    description="A python-based note/todo tracker",
+    prog='pytask',
+    description='A task manager and note taking app',
 )
-parser.add_argument("args", nargs="*")
+parser.add_argument("action", choices=action_set, nargs="?", default="next")
+parser.add_argument("inputs", nargs="*")
 
-class Status(Enum):
-    PENDING = "pending"
-    DONE = "done"
-    PAUSED = "paused"
-    ACTIVE = "active"
+def main():
+    console = Console()
+    args = parser.parse_args()
+    if args.action == None:
+        args.action = "next"
+    action_set[args.action](args.inputs)
 
-class Priority(Enum):
-    P0 = "P0"
-    P1 = "P1"
-    P2 = "P2"
-    P3 = "P3"
-
-@dataclass
-class Task:
-    status: Status= Status.PENDING
-    task_uuid: uuid.UUID = field(
-        default_factory=lambda: uuid.uuid4
-    )
-    summary: str = ""
-    notes: str = ""
-    tags: set[str] = field(default_factory=set)
-    project: str = ""
-    priority: Priority = Priority.P2
-    subtasks: list[Task] = field(default_factory=list)
-    created: datetime.datetime = field(
-        default_factory=lambda: datetime.datetime.now().astimezone()
-    )
-    due: datetime.datetime | None = None
-
-    def write_task(self) -> None:
-        path = (
-            PYTASK_CONFIG.absolute() /
-            self.status.value /
-            f"{self.task_uuid}.json"
-        )
-        path.write_text(json.dumps(asdict(self), default=str, indent=4))
-
-            
-
-        
-
-@dataclass
-class TaskList:
-    tasks: list[Task] = field(default_factory=list)
-
-def create_date(text: str) -> datetime.datetime:
-    text = text.strip().lower()
-    today = datetime.datetime.today()
-
-    if text == "today":
-        return today
-    if text == "tomorrow":
-        return datetime.datetime.today() + datetime.timedelta(days=1)
-    if text == "yesterday":
-        return datetime.datetime.today() - datetime.timedelta(days=1)
-
-    days = [d.lower() for d in calendar.day_name]
-    if text in days:
-        target = days.index(text)
-        days_ahead = (target - today.weekday()) % 7 or 7
-        return today + datetime.timedelta(days=days_ahead)
-
-    if "-" in date:
-        month, day = (int(x) for x in text.split("-"))
-        candidate = today.replace(month=month, day=day)
-        if candidate.date() < today.date():
-            candidate = candidate.replace(year=today.year + 1)
-        return candidate
-
-    raise ValueError(f"Can't parse date: {text!r}")
-
-def add_task(args: list[str]) -> None:
-    tags = []
-    summary = ""
-    task = Task()
-
-    for arg in args:
-        if "project:" in arg:
-            task.project: str = arg.split(":")[-1]
-            args.remove(arg)
-            continue
-        if "due:" in arg:
-            text = arg.split(":")[-1]
-            task.due = create_date(text)
-            args.remove(arg)
-            continue
-        if "+" in arg:
-            tags.append(arg.replace("+", ""))
-            args.remove(arg)
-            continue
-
-
-            
-        
-    task = Task(
-        status=Status.PENDING,
-    )
-
-class TaskAction(Enum):
-    ADD = task_add()
-
-        
-def main() -> None:
-    args = parser.parse_args().args
-    print(args)
+if __name__ == '__main__':
+    main()
